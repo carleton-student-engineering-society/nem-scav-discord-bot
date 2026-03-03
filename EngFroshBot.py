@@ -17,6 +17,8 @@ from common_models.models import DiscordUser
 from asgiref.sync import sync_to_async
 from random import randrange
 from django.db import close_old_connections
+from sentry_sdk import capture_exception
+import sys
 
 logger = logging.getLogger("EngFroshBot")
 
@@ -144,10 +146,14 @@ class EngFroshBot(commands.Bot):
                            exc_info=e, send_to_discord=False)
 
     async def on_error(self, event_method, *args, **kwargs):
+        e = sys.exception()
+        capture_exception(e)
         msg = f'Ignoring exception in {event_method}\n{traceback.format_exc()}'
         self.log(msg, "EXCEPTION")
 
     async def on_command_error(self, context, exception):
+        e = sys.exception()
+        capture_exception(e)
         trace = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
         msg = f'Ignoring exception in command {context.command}:\n{trace}'
         self.log(msg, "EXCEPTION")
@@ -175,14 +181,18 @@ class EngFroshBot(commands.Bot):
             msg = f'Ignoring exception in command {i.application_command}:\n{trace}'
             self.log(msg, "ERROR")
 
+    fish = [
+        1322432479621288018
+    ]
+
     async def on_message(self, message):
         close_old_connections()
         if message.author.bot:
             return
         if "fish" in message.content.lower():
-            if message.author.id == 666753178053902338:
+            if message.author.id == 794766984838381579:
                 await message.reply("https://www.youtube.com/watch?v=whnZSnW3XsI")
-            elif message.channel.id == 1196466346481950720 or message.channel.id == 1184940013331419287:
+            elif message.channel.id in self.fish:
                 if "monica" in message.content.lower():
                     if randrange(2) == 1:
                         await message.reply("https://www.youtube.com/watch?v=whnZSnW3XsI")
@@ -194,8 +204,9 @@ class EngFroshBot(commands.Bot):
         user = DiscordUser.objects.filter(id=id).first()
         if user is None:
             return "User: " + str(id) + " left guild. Cannot find info in DB!"
+        message = "User: " + str(id) + " - " + user.user.username + " left guild. Deleting records!"
         user.delete()
-        return "User: " + str(id) + " left guild. Deleting records!"
+        return message
 
     async def on_member_remove(self, member):
         self.info(await sync_to_async(self.remove)(member.id))

@@ -10,8 +10,7 @@ from asgiref.sync import sync_to_async
 import time
 from django.contrib.auth.models import Permission, Group
 
-from common_models.models import RoleInvite, DiscordUser, FroshRole
-from django.contrib.auth.models import User
+from common_models.models import RoleInvite, DiscordUser, DiscordRole, Team, DiscordChannel, Setting
 
 from EngFroshBot import EngFroshBot, is_admin, has_permission, is_superadmin
 import boto3
@@ -30,10 +29,108 @@ class Management(commands.Cog):
         self.bot = bot
         self.config = bot.config["module_settings"]["management"]
 
+    @slash_command(name="send_role_message",
+                   description="Sends a message to this channel for users to select a role")
+    @is_admin()
+    async def send_role_message(self, i: Interaction, emote: str, role: Role, message: str):
+        """Send role select message in this channel."""
+
+        await i.response.defer(with_message=True, ephemeral=True)
+        message = await i.channel.send(message)
+
+        await message.add_reaction(emote)
+        await sync_to_async(utils.register_role_message)(emote, role.id, message.id)
+
+        await i.send("Successfully created message!", ephemeral=True)
+
+    @slash_command(name="bulk_rename", description="Bulk renames channels by pattern")
+    @is_admin()
+    async def bulk_rename(self, i: Interaction, pattern: str, replacement: str):
+        await i.response.defer(ephemeral=True)
+        for c in i.guild.text_channels:
+            nsplit = c.name.split("-", 1)
+            if len(nsplit) < 2:
+                continue
+            if nsplit[1] == pattern:
+                new_name = nsplit[0] + "-" + replacement
+                await c.edit(name=new_name)
+        await i.send("Renamed channels!", ephemeral=True)
+
+    def get_types(self):
+        types = [
+            ("Frosh", Group.objects.get_or_create(name="Frosh")[0]),
+            ("Facil", Group.objects.get_or_create(name="Facil")[0]),
+            ("Head", Group.objects.get_or_create(name="Head")[0]),
+            ("Groupco", Group.objects.get_or_create(name="GroupCo")[0]),
+        ]
+        return types
+
+    def get_teams(self):
+        teams = Team.objects.all()
+        roles = {}
+        types = self.get_types()
+        cats = {}
+        for team in teams:
+            cat = DiscordChannel.objects.filter(team=team, type=4).first()
+            if cat is None:
+                continue
+            cats[team.discord_name] = cat.id
+            t_roles = []
+            for t in types:
+                t_roles += [DiscordRole.objects.filter(group_id=team.group, secondary_group_id=t[1]).first().role_id]
+            roles[team.discord_name] = t_roles
+        type_names = []
+        for t in types:
+            type_names += [t[0]]
+        return (type_names, roles, cats)
+
+    @slash_command(name="teamchannel", description="Creates a channel for all teams")
+    @is_admin()
+    async def teamchannel(self, i: Interaction, team_role: str,
+                          role1: Role, role2: Optional[Role], role3: Optional[Role],
+                          suffix: Optional[str]):
+        await i.response.defer(ephemeral=True)
+        if team_role not in ["Head", "Facil", "Frosh"]:
+            await i.send("Invalid team role! Note they must be in the format \"Head\", etc", ephemeral=True)
+            return
+        team_data = await sync_to_async(self.get_teams)()
+        types = team_data[0]
+        for j in range(len(types)):
+            t = types[j]
+            if t == team_role:
+                index = j
+                break
+        if index == -1:
+            await i.send("Unable to find team role!", ephemeral=True)
+        teams = team_data[1]
+        cats = team_data[2]
+        perms = {}
+        perms[i.guild.default_role] = PermissionOverwrite(read_messages=False)
+        for r in [role1, role2, role3, i.guild.get_role(self.config['froshadmin_role'])]:
+            if r is not None:
+                perms[r] = PermissionOverwrite(read_messages=True)
+        for team, roles in teams.items():
+            cat = i.guild.get_channel(cats[team])
+            if suffix is None:
+                name = team + "-" + types[index] + "-" + role1.name
+                if role2 is not None:
+                    name += "-" + role2.name
+                if role3 is not None:
+                    name += "-" + role3.name
+            else:
+                name = team + "-" + suffix
+            cperms = perms.copy()
+            for j in range(index, len(types)):
+                r = i.guild.get_role(roles[j])
+                cperms[r] = PermissionOverwrite(read_messages=True)
+            await i.guild.create_text_channel(name, category=cat, overwrites=cperms)
+        await i.send("Created channels!", ephemeral=True)
+
     @slash_command(name="purge", description="Purge all messages from this channel.")
     @has_permission("common_models.purge_channels")
     async def purge(self, i: Interaction, channel_id: Optional[str] = None):
         """Purge the channel, only available to admin."""
+        await i.response.defer(ephemeral=True)
 
         if isinstance(i.channel, TextChannel):
             await i.channel.purge()  # type: ignore
@@ -43,26 +140,52 @@ class Management(commands.Cog):
 
         return
 
-    def get_all_non_planning(self):
-        users = list(User.objects.filter(is_staff=False))
-        planning = FroshRole.objects.filter(name="Planning").first().group
-        users = DiscordUser.objects.exclude(user__groups__in=[planning])
+    @slash_command(name="spirit_on_duty", description="Sets the current spirit on duty.")
+    @has_permission("common_models.spirit_on_duty")
+    async def spirit_on_duty(self, i: Interaction, user1: Optional[Member] = None, user2: Optional[Member] = None,
+                             user3: Optional[Member] = None, user4: Optional[Member] = None,
+                             user5: Optional[Member] = None):
+        role = i.guild.get_role(self.config['spirit_role'])
+        for m in role.members:
+            await m.remove_roles(role)
+        if user1 is not None:
+            await user1.add_roles(role)
+        if user2 is not None:
+            await user2.add_roles(role)
+        if user3 is not None:
+            await user3.add_roles(role)
+        if user4 is not None:
+            await user4.add_roles(role)
+        if user5 is not None:
+            await user5.add_roles(role)
+        await i.send("Changed spirit on duty!", ephemeral=True)
+
+    def get_all_non_kick(self):
+        groups = Setting.objects.get_or_create(id="nokick_groups",
+                                               defaults={"value": "Planning,Head,Kick Exempt"})[0].value
+        groups_query = Group.objects.filter(name__in=groups.split(","))
+        users = DiscordUser.objects.exclude(user__groups__in=list(groups_query))
         discords = list()
         for user in users:
+            if user.user.is_staff:
+                continue
             discords += [user.id]
         return discords
 
     @slash_command(name="kick_all", description="Kicks all non planning users")
     @is_admin()
-    async def kick_all(self, i: Interaction):
-        await i.response.defer()
-        non_planning = await sync_to_async(self.get_all_non_planning)()
+    async def kick_all(self, i: Interaction, dry_run: bool = False):
+        await i.response.defer(ephemeral=True)
+        non_planning = await sync_to_async(self.get_all_non_kick)()
         guild = i.guild
-        for user in non_planning:
-            try:
-                await guild.get_member(user).kick(reason="Frosh is over!")
-            except Exception:
-                pass
+        if not dry_run:
+            for user in non_planning:
+                try:
+                    await guild.get_member(user).kick(reason="Frosh is over!")
+                except Exception:
+                    pass
+        else:
+            print(non_planning)
         await i.send("Kicked all users!", ephemeral=True)
 
     @slash_command(name="add_role_to_role", description="Adds a role to every user with a role")
@@ -186,6 +309,7 @@ class Management(commands.Cog):
 
     @slash_command(name="clear_nicks", description="Clears all nicknames")
     async def clear_nicks(self, i: Interaction):
+        await i.response.defer(ephemeral=True)
         async for user in i.guild.fetch_members():
             try:
                 await sync_to_async(utils.discord_clear_name)(user.id)
@@ -200,6 +324,20 @@ class Management(commands.Cog):
     async def echo(self, i: Interaction, message: str):
         await i.send("Echod message!", ephemeral=True)
         await i.channel.send(message)
+
+    @slash_command(name="edit_role", description="Adds a permission to a role")
+    @is_admin()
+    async def edit_role(self, i: Interaction, role: Role, name: str, value: bool):
+        perms = role.permissions
+        perms.update(**{name: value})
+        await role.edit(permissions=perms)
+        await i.send("Updated role!", ephemeral=True)
+
+    @slash_command(name="add_role_to_user", description="Adds a role to a user")
+    @is_admin()
+    async def add_role_to_user(self, i: Interaction, user: Member, role: Role):
+        await user.add_roles(role)
+        await i.send("Added role to user!", ephemeral=True)
 
     @slash_command(name="channels", description="Lists all the channels in the server")
     @is_admin()
@@ -362,13 +500,25 @@ class Management(commands.Cog):
 
         if user_id == self.bot.user.id:
             return
+        role_id = await sync_to_async(utils.role_react)(message_id, emoji.name)
+        if role_id is not None:
+            guild = self.bot.get_guild(payload.guild_id)
+            user = guild.get_member(payload.user_id)
+            role = guild.get_role(role_id)
+            await user.add_roles(role)
+            self.bot.info("Added user " + str(payload.user_id) + " to role " + str(role_id), send_to_discord=False)
+            return
         for message in await sync_to_async(utils.get_messages)("pronoun"):
             if message_id == message.id:
                 try:
                     await sync_to_async(utils.discord_add_pronoun)(emoji.name, user_id)
                     new_name = await sync_to_async(utils.compute_discord_name)(user_id)
-                    await member.edit(nick=new_name)
-                    self.bot.info("Added pronoun to user " + member.name + " -> " + new_name, send_to_discord=False)
+                    if len(new_name) > 32:
+                        self.bot.info("Did not add pronoun to user (name too long)" +
+                                      member.name + " -> " + new_name, send_to_discord=False)
+                    else:
+                        await member.edit(nick=new_name)
+                        self.bot.info("Added pronoun to user " + member.name + " -> " + new_name, send_to_discord=False)
                     break
                 except Exception as e:
                     self.bot.log("Failed to add pronoun to user " + member.name, level="ERROR",)
@@ -385,6 +535,14 @@ class Management(commands.Cog):
         message_id = payload.message_id
 
         if user_id == self.bot.user.id:
+            return
+        role_id = await sync_to_async(utils.role_react)(message_id, emoji.name)
+        if role_id is not None:
+            guild = self.bot.get_guild(payload.guild_id)
+            user = guild.get_member(payload.user_id)
+            role = guild.get_role(role_id)
+            await user.remove_roles(role)
+            self.bot.info("Removed user " + str(payload.user_id) + " from role " + str(role_id), send_to_discord=False)
             return
         for message in await sync_to_async(utils.get_messages)("pronoun"):
             if message_id == message.id:
@@ -460,7 +618,7 @@ class Management(commands.Cog):
         if self.get(guild.categories, name) is not None:
             await i.send("This category already exists!", ephemeral=True)
             return
-        perms = Permissions(change_nickname=True, read_messages=True, send_messages=True)
+        perms = Permissions(read_messages=True, send_messages=True)
         role = await guild.create_role(name=name, mentionable=True, hoist=True, permissions=perms)
         overwrites = {role: PermissionOverwrite(view_channel=True),
                       guild.default_role: PermissionOverwrite(view_channel=False)}
